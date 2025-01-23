@@ -34,8 +34,9 @@ function user:new(system)
                 }
             end
             f:close()
+            system.log.log({level="debug"},"User metadata loaded")
         else
-            system.log.log({level="warning"},"Metadata file not found at " .. self.metaFilePath .. ", starting fresh.")
+            system.log.log({level="error"},"User metadata file not found at " .. self.metaFilePath .. ", starting fresh.")
         end
     end
 

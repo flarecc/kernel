@@ -4,9 +4,126 @@ local nativeShutdown = os.shutdown
 local PROC = {}
 local PID = 0
 SYS = {}
+local useTTY = false
 
+--#region setup
+local ofs = fs
+function panic(ae)
+    term.setBackgroundColor(32768)
+    term.setTextColor(16384)
+    term.setCursorBlink(false)
+    local p, q = term.getCursorPos()
+    p = 1
+    local af, ag = term.getSize()
+    ae = "panic: " .. (ae or "unknown")
+    for ah in ae:gmatch "%S+" do
+        if p + #ah >= af then
+            p, q = 1, q + 1
+            if q > ag then
+                term.scroll(1)
+                q = q - 1
+            end
+        end
+        term.setCursorPos(p, q)
+        if p == 1 then term.clearLine() end
+        term.write(ah .. " ")
+        p = p + #ah + 1
+    end
+    p, q = 1, q + 1
+    if q > ag then
+        term.scroll(1)
+        q = q - 1
+    end
+    if debug then
+        local ai = debug.traceback(nil, 2)
+        for aj in ai:gmatch "[^\n]+" do
+            term.setCursorPos(1, q)
+            term.write(aj)
+            q = q + 1
+            if q > ag then
+                term.scroll(1)
+                q = q - 1
+            end
+        end
+    end
+    term.setCursorPos(1, q)
+    term.setTextColor(2)
+    term.write("panic: We are hanging here...")
+    mainThread = nil
+    while true do coroutine.yield() end
+end
+
+local expect
+
+function loadfile(filename, mode, env)
+    -- Support the previous `loadfile(filename, env)` form instead.
+    if type(mode) == "table" and env == nil then
+        mode, env = nil, mode
+    end
+
+    expect(1, filename, "string")
+    expect(2, mode, "string", "nil")
+    expect(3, env, "table", "nil")
+
+    local file = ofs.open(filename, "r")
+    if not file then return nil, "File not found" end
+
+    local func, err = load(file.readAll(), "@/" .. ofs.combine(filename), mode, env)
+    file.close()
+    return func, err
+end
+
+function dofile(_sFile)
+    expect(1, _sFile, "string")
+
+    local fnFile, e = loadfile(_sFile, nil, _G)
+    if fnFile then
+        return fnFile()
+    else
+        error(e, 2)
+    end
+end
+
+do
+    local h = fs.open("rom/modules/main/cc/expect.lua", "r")
+    local f, err = (_VERSION == "Lua 5.1" and loadstring or load)(h.readAll(), "@/rom/modules/main/cc/expect.lua")
+    h.close()
+
+    if not f then error(err) end
+    expect = f()
+end
+
+function setfenv(fn, env)
+    if not debug then error("could not set environment", 2) end
+    if type(fn) == "number" then fn = debug.getinfo(fn + 1, "f").func end
+    local i = 1
+    while true do
+        local name = debug.getupvalue(fn, i)
+        if name == "_ENV" then
+            debug.upvaluejoin(fn, i, (function()
+                return env
+            end), 1)
+            break
+        elseif not name then
+            break
+        end
+
+        i = i + 1
+    end
+
+    return fn
+end
+
+--#endregion
+
+local fslib = dofile("/proot/tfs.lua")
 ---@type FileSystem
-fs = fs
+local FS = fslib:new()
+
+local signal={SIGHUP=1,SIGINT=2,SIGQUIT=3,SIGTRAP=5,SIGABRT=6,SIGKILL=9,SIGPIPE=13,SIGTERM=15,SIGCONT=18,SIGSTOP=19,SIGTTIN=21,SIGTTOU=22}
+term = FS:exec("/lib/term.lua",0)()
+
+
 local expect = dofile("rom/modules/main/cc/expect.lua")
 if _VERSION == "Lua 5.1" and load("::a:: goto a") then
     _VERSION = "Lua 5.2"
@@ -15,7 +132,6 @@ if _VERSION == "Lua 5.1" and load("::a:: goto a") then
         if load("local <const> a = 2") then _VERSION = "Lua 5.4" end
     end
 end;
-colors = fs:exec("/lib/colors.lua",0)()
 local system = {
     proc = {
         qEvnt = false,
@@ -34,7 +150,219 @@ setmetatable(system.os,{__index=os})
 --os = nil
 
 --#region DEFINES
-local keys=fs:exec("/lib/keys.lua",0)()
+---@module "keys"
+local keys=FS:exec("/lib/keys.lua",0)()
+
+colors = FS:exec("/lib/colors.lua",0)()
+
+local function writeANSI(nativewrite)
+    return function(str)
+        local seq = nil
+        local bold = false
+        local lines = 0
+        local function getnum(d) 
+            if seq == "[" then return d or 1
+            elseif string.find(seq, ";") then return 
+                tonumber(string.sub(seq, 2, string.find(seq, ";") - 1)), 
+                tonumber(string.sub(seq, string.find(seq, ";") + 1)) 
+            else return tonumber(string.sub(seq, 2)) end 
+        end
+        for c in string.gmatch(str, ".") do
+            if seq == "\27" then
+                if c == "c" then
+                    term.setBackgroundColor(0x8000)
+                    term.setTextColor(1)
+                    term.setCursorBlink(true)
+                elseif c == "[" then seq = "["
+                else seq = nil end
+            elseif seq ~= nil and string.sub(seq, 1, 1) == "[" then
+                if tonumber(c) ~= nil or c == ';' then seq = seq .. c else
+                    
+                    if c == "A" then term.setCursorPos(term.getCursorPos(), select(2, term.getCursorPos()) - getnum())
+                    elseif c == "B" then term.setCursorPos(term.getCursorPos(), select(2, term.getCursorPos()) + getnum())
+                    elseif c == "C" then term.setCursorPos(term.getCursorPos() + getnum(), select(2, term.getCursorPos()))
+                    elseif c == "D" then term.setCursorPos(term.getCursorPos() - getnum(), select(2, term.getCursorPos()))
+                    elseif c == "E" then term.setCursorPos(1, select(2, term.getCursorPos()) + getnum())
+                    elseif c == "F" then term.setCursorPos(1, select(2, term.getCursorPos()) - getnum())
+                    elseif c == "G" then term.setCursorPos(getnum(), select(2, term.getCursorPos()))
+                    elseif c == "H" then term.setCursorPos(getnum())
+                    elseif c == "J" then term.clear() -- ?
+                    elseif c == "K" then term.clearLine() -- ?
+                    elseif c == "T" then term.scroll(getnum())
+                    elseif c == "f" then term.setCursorPos(getnum())
+                    elseif c == "m" then
+                        local n, m = getnum(0)
+                        if n == 0 then
+                            term.setBackgroundColor(0x8000)
+                            term.setTextColor(1)
+                        elseif n == 1 then bold = true
+                        elseif n == 7 or n == 27 then
+                            local bg = term.getBackgroundColor()
+                            term.setBackgroundColor(term.getTextColor())
+                            term.setTextColor(bg)
+                        elseif n == 22 then bold = false
+                        elseif n >= 30 and n <= 37 then term.setTextColor(2^(15 - (n - 30) - (bold and 8 or 0)))
+                        elseif n == 39 then term.setTextColor(1)
+                        elseif n >= 40 and n <= 47 then term.setBackgroundColor(2^(15 - (n - 40) - (bold and 8 or 0)))
+                        elseif n == 49 then term.setBackgroundColor(0x8000) 
+                        elseif n >= 90 and n <= 97 then
+                            
+                            term.setTextColor(2^(15 - (n - 90) - 8))
+                        elseif n >= 100 and n <= 107 then term.setBackgroundColor(2^(15 - (n - 100) - 8))
+                        end
+                        if m ~= nil then
+                            if m == 0 then
+                                term.setBackgroundColor(0x8000)
+                                term.setTextColor(1)
+                            elseif m == 1 then bold = true
+                            elseif m == 7 or m == 27 then
+                                local bg = term.getBackgroundColor()
+                                term.setBackgroundColor(term.getTextColor())
+                                term.setTextColor(bg)
+                            elseif m == 22 then bold = false
+                            elseif m >= 30 and m <= 37 then term.setTextColor(2^(15 - (m - 30) - (bold and 8 or 0)))
+                            elseif m == 39 then term.setTextColor(1)
+                            elseif m >= 40 and m <= 47 then term.setBackgroundColor(2^(15 - (m - 40) - (bold and 8 or 0)))
+                            elseif m == 49 then term.setBackgroundColor(0x8000) 
+                            elseif n >= 90 and n <= 97 then term.setTextColor(2^(15 - (n - 90) - 8))
+                            elseif n >= 100 and n <= 107 then term.setBackgroundColor(2^(15 - (n - 100) - 8)) end
+                        end
+                    elseif c == "z" then
+                        local n, m = getnum(0)
+                        if n == 0 then
+                            term.setBackgroundColor(0x8000)
+                            term.setTextColor(1)
+                        elseif n == 7 or n == 27 then
+                            local bg = term.getBackgroundColor()
+                            term.setBackgroundColor(term.getTextColor())
+                            term.setTextColor(bg)
+                        elseif n >= 25 and n <= 39 then term.setTextColor(n-25)
+                        elseif n >= 40 and n <= 56 then term.setBackgroundColor(n-40)
+                        end
+                        if m ~= nil then
+                            if m == 0 then
+                                term.setBackgroundColor(0x8000)
+                                term.setTextColor(1)
+                            elseif m == 7 or m == 27 then
+                                local bg = term.getBackgroundColor()
+                                term.setBackgroundColor(term.getTextColor())
+                                term.setTextColor(bg)
+                            elseif m >= 25 and m <= 39 then term.setTextColor(m-25)
+                            elseif m >= 40 and m <= 56 then term.setBackgroundColor(m-40)
+                        end
+                    end
+                    end
+                    seq = nil
+                end
+            elseif c == string.char(0x1b) then seq = "\27"
+            else lines = lines + (nativewrite(c) or 0) end
+        end
+        return lines
+    end
+end
+
+local function intrnl_write(sText)
+    expect(1, sText, "string", "number")
+
+    local w, h = term.getSize()
+    local x, y = term.getCursorPos()
+
+    local nLinesPrinted = 0
+    local function newLine()
+        if y + 1 <= h then
+            term.setCursorPos(1, y + 1)
+        else
+            term.setCursorPos(1, h)
+            term.scroll(1)
+        end
+        x, y = term.getCursorPos()
+        nLinesPrinted = nLinesPrinted + 1
+    end
+
+    -- Print the line with proper word wrapping
+    sText = tostring(sText)
+    while #sText > 0 do
+        local whitespace = string.match(sText, "^[ \t]+")
+        if whitespace then
+            -- Print whitespace
+            term.write(whitespace)
+            x, y = term.getCursorPos()
+            sText = string.sub(sText, #whitespace + 1)
+        end
+
+        local newline = string.match(sText, "^\n")
+        if newline then
+            -- Print newlines
+            newLine()
+            sText = string.sub(sText, 2)
+        end
+
+        local text = string.match(sText, "^[^ \t\n]+")
+        if text then
+            sText = string.sub(sText, #text + 1)
+            if #text > w then
+                -- Print a multiline word
+                while #text > 0 do
+                    if x > w then
+                        newLine()
+                    end
+                    term.write(text)
+                    text = string.sub(text, w - x + 2)
+                    x, y = term.getCursorPos()
+                end
+            else
+                -- Print a word normally
+                if x + #text - 1 > w then
+                    newLine()
+                end
+                term.write(text)
+                x, y = term.getCursorPos()
+            end
+        end
+    end
+
+    return nLinesPrinted
+end
+
+write = writeANSI(intrnl_write)
+
+function print(...)
+    local nLinesPrinted = 0
+    local nLimit = select("#", ...)
+    for n = 1, nLimit do
+        local s = tostring(select(n, ...))
+        if n < nLimit then
+            s = s .. "\t"
+        end
+        nLinesPrinted = nLinesPrinted + write(s)
+    end
+    nLinesPrinted = nLinesPrinted + write("\n")
+    return nLinesPrinted
+end
+
+function printError(...)
+    local oldColour
+    if term.isColour() then
+        oldColour = term.getTextColour()
+        term.setTextColour(colors.red)
+    end
+    print(...)
+    if term.isColour() then
+        term.setTextColour(oldColour)
+    end
+end
+
+function printWarning(...)
+    local oldColour
+    if term.isColour() then
+        oldColour = term.getTextColour()
+        term.setTextColour(colors.yellow)
+    end
+    print(...)
+    if term.isColour() then
+        term.setTextColour(oldColour)
+    end
+end
 --#endregion
 
 --#region system
@@ -345,6 +673,27 @@ function system.sleep(nTime)
 end
 --#endregion
 
+--#region tty
+---@module "window"
+local window = FS:exec("/lib/window.lua",0)()
+local TTY = {}
+do
+    local w,h = term.getSize()
+    TTY = {
+        window.create(term.current(),1,1,w,h,true),
+        window.create(term.current(),1,1,w,h,false)
+    }
+    TTY[2].setVisible(false)
+end
+function SYSCALL.switchTTY(proc,id)
+    for index, value in ipairs(TTY) do
+        value.setVisible(false)
+    end
+    TTY[id].setVisible(true)
+    TTY[id].redraw()
+end
+--#endregion
+
 --#region proc
 
 local function preempt_hook()
@@ -355,7 +704,9 @@ local function makeProcFAKE(name)
         filter = nil,
         pid = PID,
         name = name,
-        user = 0
+        user = 0,
+        signal = 0,
+        status = 0
     }
     PID = PID + 1
     system.proc.procs = system.proc.procs + 1
@@ -377,7 +728,11 @@ local function makeProc(f, ...)
         filter = nil,
         pid = PID,
         name = ("P_%d"):format(PID),
-        user = 0
+        user = 0,
+        signal = 0,
+        status = 0,
+        tty = TTY[1],
+        onSig = nil,
     }
     local function crash(a)
         system.log.log({level = "error",process=p.pid,traceback=true},"process crashed",a)
@@ -390,6 +745,22 @@ local function makeProc(f, ...)
     PID = PID + 1
     system.proc.procs = system.proc.procs + 1
     function p:continue(...)
+        --term.redirect(self.tty)
+        local sig = self.signal
+        if self.signal > 0 and self.onSig then
+            xpcall(self.onSig,panic)
+        end
+        if self.status == 2 then
+            if sig == 18 then
+                self.status = 0
+                self.signal = 0
+            else
+                return
+            end
+        end
+        if useTTY then
+            term.redirect(self.tty)
+        end
         local result = { coroutine.resume(self.c, ...) }
         local ok, typ, sFunc, tArg = result[1], result[2], result[3], result[4]
         if ok then
@@ -397,7 +768,7 @@ local function makeProc(f, ...)
                 if coroutine.status(self.c) == "dead" then
                     self:endProc()
                 else
-                    p:continue(SYSCALL[sFunc](self,table.unpack(tArg)))
+                    self:continue(SYSCALL[sFunc](self,table.unpack(tArg)))
                 end
             elseif typ == "EVENT" then
                 self.filter = sFunc
@@ -410,7 +781,17 @@ local function makeProc(f, ...)
             print(typ)
             self:endProc()
         end
+        self.tty = term.current()
         if coroutine.status(self.c) == "dead" then
+            self:endProc()
+        end
+        if self.signal == 19 then
+            self.status =2
+        elseif self.signal == signal.SIGKILL then
+            self:endProc()
+        elseif self.signal == 2 then
+            self:endProc()
+        elseif self.signal == 3 then
             self:endProc()
         end
     end
@@ -443,8 +824,18 @@ function SYSCALL.proc(proc,func, ...)
     return p
 end
 function SYSCALL.end_proc(proc,pid)
-    pid = pid or proc
+    local p = PROC[pid] or proc
+    p.signal = signal.SIGKILL
+end
+
+function SYSCALL.force_end_proc(proc,pid)
+    pid = pid or proc.pid
+    if PROC[pid] then
     PROC[pid]:endProc()
+    end
+end
+function SYSCALL.onSignal(proc,func)
+    proc.onSig = func
 end
 
 function SYSCALL.fork(proc,name,func)
@@ -452,13 +843,23 @@ function SYSCALL.fork(proc,name,func)
     local pid = SYSCALL.proc(proc,func)
     PROC[pid].name =name
     PROC[pid].user =proc.user
+    PROC[pid].tty = proc.tty
     return pid
 end
+
 function SYSCALL.setUser(proc,uid)
     proc.user = uid
 end
 function SYSCALL.procUser(proc)
     return proc.user
+end
+function SYSCALL.signal(proc)
+    local sig = proc.signal
+    proc.signal = 0
+    return sig
+end
+function SYSCALL.signalProc(proc,pid,sig)
+    PROC[pid].signal = sig
 end
 
 function SYSCALL.procs(proc)
@@ -470,6 +871,12 @@ function SYSCALL.procs(proc)
 end
 function SYSCALL.nameProc(proc,name)
     proc.name = name
+end
+function SYSCALL.getProcName(proc,pid)
+    return PROC[pid].name
+end
+function SYSCALL.getCurentProcName(proc)
+    return proc.name
 end
 function SYSCALL.getPID(proc)
     return proc.pid
@@ -512,7 +919,7 @@ local levels_colors = {
 }
 for v = -1, #levels do levels_lower[levels[v]:lower()] = v end
 local e
-system.log.syslogFile,e = fs:open("/var/log/kern.log","w",0)
+system.log.syslogFile,e = FS:open("/var/log/kern.log","w",0)
 
 ---@param y any
 ---@param am any
@@ -568,7 +975,14 @@ function system.log.log(field,...)
             levels[field.level],
             a0,
             "\27[0m" or "")
+    local TRM
+    if useTTY then
+        TRM = term.current()
+        term.redirect(TTY[2])
+    end
+    
     print(t)
+    if useTTY then term.redirect(TRM) end
     t = ("%s[%s]<%9s> %8s[%02d%s]%s [%8s]: %s%s"):format(
             levels_colors[field.level] or "",
             system.bios.date("%b %d %X", field.time / 1000),
@@ -592,7 +1006,7 @@ function SYSCALL.log(proc,param,...)
 
 end
 
-system.log.log({level = "info"},"proot os starting")
+system.log.log({level = "Notice"},"proot os starting")
 system.log.log({level = 0},_VERSION)
 system.log.log({level = 0},_HOST)
 system.log.log({level = "debug"},_KERNEL)
@@ -601,13 +1015,14 @@ if _VERSION ~= "Lua 5.2" then
     system.log.log({level = "Warning"},"Unsuported LUA VERSION")
 end
 
-system.log.log({level = "Notice"},"BOOTLOADER VERSION, os has NO access to the real file system")
-
 
 --#endregion
 
 --#region fs
-system.log.log({level = "info"},"FS loading")
+system.log.log({level = "Notice"},"FS loading")
+---@type FileSystem
+fs = FS
+
 local DFS = fs:exec("/lib/devFS.lua",0)()
 local dev = DFS:new()
 system.log.log({level = "debug"},"mounting /dev")
@@ -664,6 +1079,19 @@ dev:addDevice("stdout", function(op, data)
         return ""
     end
 end)
+
+do
+    local stdioData = ""
+    dev:addDevice("stdio", function(op, data)
+        if op == "write" then
+            stdioData = data
+            return nil
+        elseif op == "read" then
+            return stdioData
+        end
+    end)
+end
+
 system.log.log({level="debug"},"/dev virtual files loaded")
 
 
@@ -698,7 +1126,7 @@ end
 
 --#endregion
 
-local dI = panic;
+local oldPanic = panic;
 local function panic(ae)
     xpcall(
         function()
@@ -709,7 +1137,7 @@ local function panic(ae)
             end; system.log.log({ level = "panic" }, "We are hanging here...")
             term.setCursorBlink(false)
             mainThread = nil; while true do coroutine.yield() end
-        end, function(A) dI(ae .. "; and an error occurred while logging the error: " .. A) end)
+        end, function(A) oldPanic(ae .. "; and an error occurred while logging the error: " .. A) end)
 end;
 
 --#region Kernel Modules
@@ -737,7 +1165,7 @@ for key, value in pairs(fs:list("/boot/drv/",0)) do
     end
     do
         local env = driverEnv()
-        e=  setfenv(fs:exec("/boot/drv/"..value,0),env)()
+        e= setfenv(fs:exec("/boot/drv/"..value,0),env)()
     end
     if e ~= nil and type(e)=="table" then
         system.log.log({level = "debug",category="DRIVERS"},"Loading driver",value)
@@ -769,16 +1197,6 @@ for key, value in pairs(drvr) do
         startDriver(value.name,value)
     end
 end
-
-local function deviceMng()
-    coroutine.yield("SYSCALL","log",{{level = "debug",category="DRIVERS"},"device Manager started"})
-    while true do
-        local e,side = coroutine.yield("EVENT","peripheral")
-        
-        coroutine.yield("SYSCALL","log",{{level = "debug",category="DRIVERS"},"attached",side})
-    end
-    
-end
 system.log.log({level = "debug"},"Drivers Loaded")
 --#endregion
 
@@ -807,7 +1225,7 @@ for key, value in pairs(users.users) do
 
 end
 if fs:Permissions("/",0) ~= 7 then
-    system.log.log({level = "error"},"Root lacks perms")
+    system.log.log({level = "Critical"},"Root lacks perms")
 end
 
 function SYSCALL.getShortName(proc)
@@ -835,20 +1253,25 @@ local function start_cash(uid)
     local function waitForAny(...)
         local procs = {}
         local curName = PROC[system.proc.curProc].name
+        local wait = true
         for key, value in ipairs({...}) do
             procs[key] = SYSCALL.fork(PROC[system.proc.curProc],curName.."_"..key,function()
                 value()
-                for index, value in ipairs(procs) do
-                    SYSCALL.end_proc(nil,value)
-                end
+                wait = false
             end)
+        end
+        while wait do
+            coroutine.yield()
+        end
+        for index, value in ipairs(procs) do
+            SYSCALL.end_proc(nil,value)
         end
 
     end
     local function ldFile(fname,env)
         local f,e = ufs.exec(fname)
         if e then
-            error(e)
+            error(e,1)
         end
         setfenv(f,env)
         return f
@@ -955,6 +1378,7 @@ local function USRMNG()
     F()
     
 end
+
 local function execENV(f)
     local k = {}
     setmetatable(k,{__index=function (t, k)
@@ -986,7 +1410,47 @@ local function execENV(f)
         return f
     end
     
-    coroutine.yield("SYSCALL","log",{{level="debug"},"User Manager starting"})
+    
+    
+    f = setfenv(f,e)
+    return f
+    
+end
+system.users = users
+local function execSys(f)
+    local k = {}
+    setmetatable(k,{__index=function (t, k)
+        return function(...)
+            if SYSCALL[k] == nil then
+                error(k.." unknown")
+            end
+            return SYSCALL[k](PROC[system.proc.curProc],...)
+        end
+    end})
+    local e = {
+        coroutine=coroutine,
+        textutils=textutils,
+        os =system.os,
+        kernel=k,
+        keys = keys,
+        read=system.read,
+        system=system,
+        signal =signal,
+        _G = _G
+    }
+    
+    e = setmetatable(e,{__index=_G})
+
+    function e.loadfile(fname,env)
+        env = env or e
+        local f,E = fs:exec(fname,0)
+        if E then
+            error(E)
+        end
+        setfenv(f,env)
+        return f
+    end
+    
     
     
     f = setfenv(f,e)
@@ -994,31 +1458,56 @@ local function execENV(f)
     
 end
 
-
+system.panic = panic
 
 --#region thread
-for key, value in pairs(fs:list("/dev/",0)) do
-    system.log.log({level = "debug"},fs:getPermissions("/dev/"..value,0),value)
-    
-end
-system.log.log({level = "info"},"threads starting")
+local function threads()
+    system.log.log({level = "Notice"},"threads starting")
 system.log.log({level = "debug"},"system threads starting")
-system.proc.sys.dev = SYSCALL.proc(0,deviceMng)
-PROC[system.proc.sys.dev].name = "DEVMNG"
 
-system.proc.sys.usr = SYSCALL.proc(0,USRMNG)
-PROC[system.proc.sys.usr].name = "USRMNG"
-system.proc.sys.login = SYSCALL.proc(0,execENV(fs:exec("/usr/bin/login.lua",0)))
-PROC[system.proc.sys.login].name = "LOGIN"
+system.proc.sys.sysctl = SYSCALL.proc(0,execSys(fs:exec("/usr/bin/sysinit.lua",0)))
+PROC[system.proc.sys.sysctl].name = "sysctl"
+
+--system.proc.sys.usr = SYSCALL.proc(0,USRMNG)
+--PROC[system.proc.sys.usr].name = "USRMNG"
+
+--system.proc.sys.login = SYSCALL.proc(0,execENV(fs:exec("/usr/bin/login.lua",0)))
+--PROC[system.proc.sys.login].name = "LOGIN"
+
+
+
+
 system.log.log({level = "debug"},"system threads started")
 --makeProc(task1)
 --SYSCALL.fork(0,"FSMNG",FSMNG)
 --SYSCALL.proc(0,task2)
 
 system.bios.queueEvent("SYSTEM_STARTUP")
+
+local keysPressed = {}
+local fnum = {}
+
+for i = 1, 10, 1 do
+    fnum[i] = keys["f"..i]
+end
+
 while true do
     local tEventData = { coroutine.yield() }
     local sEvent = tEventData[1]
+    if tEventData[1] == "key" then
+        keysPressed[tEventData[2]] = true
+        if keysPressed[keys.leftCtrl] and keysPressed[keys.leftShift] then
+            for key, value in pairs(fnum) do
+                if keysPressed[value] then
+                    SYSCALL.switchTTY(nil,key)
+                    keysPressed[value] = false
+                    break
+                end
+            end
+        end
+    elseif tEventData[1] == "key_up" then
+        keysPressed[tEventData[2]] = false
+    end
     system.proc.qEvnt = true
     for key, value in pairs(PROC) do
         value:resume(sEvent, tEventData)
@@ -1027,5 +1516,7 @@ while true do
         system.bios.queueEvent("_preempt_hook")
     end
 end
+end
+xpcall(threads,oldPanic)
 --#endregion
 panic("PANIX")
